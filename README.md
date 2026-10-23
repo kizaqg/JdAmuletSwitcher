@@ -60,3 +60,12 @@ dotnet publish -c Release -r win-x64 -p:PublishSingleFile=true --self-contained 
 * **Pause** — включить или выключить макросы (работает глобально, клавишу можно сменить).
 * **Ctrl+1…Ctrl+5** — связки бара (настраиваются). Основной амулет — своя комбинация.
 * При зажатых Ctrl/Alt/Shift связка по клавише скилла не срабатывает: такие нажатия уходят в игру без изменений.
+
+## Готовые сборки
+
+GitHub Actions собирает exe при каждом push в `main`: вкладка **Actions** → последний запуск **Build** → раздел **Artifacts**.
+
+* `JdAmuletSwitcher-light-win-x64` — лёгкий exe, нужен [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0);
+* `JdAmuletSwitcher-selfcontained-win-x64` — exe без зависимостей.
+
+Для релиза создайте тег, например `git tag v1.0.0 && git push origin v1.0.0` — архивы появятся на странице **Releases**.

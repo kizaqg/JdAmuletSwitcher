@@ -1,0 +1,52 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish (framework-dependent, нужен .NET 8 Desktop Runtime)
+        run: dotnet publish -c Release -r win-x64 -p:PublishSingleFile=true --self-contained false -o out/light
+
+      - name: Publish (self-contained, без зависимостей)
+        run: dotnet publish -c Release -r win-x64 -p:PublishSingleFile=true --self-contained true -o out/full
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path out/light/JdAmuletSwitcher.exe, README.md -DestinationPath JdAmuletSwitcher-light-win-x64.zip
+          Compress-Archive -Path out/full/JdAmuletSwitcher.exe, README.md -DestinationPath JdAmuletSwitcher-selfcontained-win-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JdAmuletSwitcher-light-win-x64
+          path: out/light/JdAmuletSwitcher.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JdAmuletSwitcher-selfcontained-win-x64
+          path: out/full/JdAmuletSwitcher.exe
+
+      - name: GitHub Release (для тегов v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            JdAmuletSwitcher-light-win-x64.zip
+            JdAmuletSwitcher-selfcontained-win-x64.zip
+          generate_release_notes: true
