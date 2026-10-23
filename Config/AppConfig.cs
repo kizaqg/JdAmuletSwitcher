@@ -111,7 +111,6 @@ public sealed class AppConfig
     public Keys ToggleKey { get; set; } = Keys.Pause;
     /// <summary>Сколько держать нажатой клавишу амулета (и минимум для скилла). Игра опрашивает клавиши раз в кадр.</summary>
     public int KeyHoldMs { get; set; } = 30;
-    public bool AlwaysEquip { get; set; }
     public bool StartMinimized { get; set; }
     public bool LogEnabled { get; set; } = true;
     public string ActiveProfile { get; set; } = "Основной";

@@ -255,6 +255,15 @@ public sealed class OverlayBar : Form
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
+
+        if (e.Button == MouseButtons.Right)
+        {
+            // Правый клик по амулету: «он уже надет в игре» — синхронизация без нажатия клавиши
+            foreach (Item it in _items)
+                if (it.Rect.Contains(e.Location)) { _engine.MarkEquipped(it.Group); return; }
+            if (_statusRect.Contains(e.Location)) _engine.ResetAmuletState();
+            return;
+        }
         if (e.Button != MouseButtons.Left) return;
 
         if (_statusRect.Contains(e.Location))

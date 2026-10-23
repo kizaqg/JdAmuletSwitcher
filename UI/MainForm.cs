@@ -27,7 +27,6 @@ public sealed class MainForm : Form
     private readonly ComboBox _inputMode = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 230 };
     private readonly NumericUpDown _holdMs = new() { Minimum = AppConfig.MinHoldMs, Maximum = AppConfig.MaxHoldMs, Width = 60 };
     private readonly KeyCaptureBox _toggleKey = new() { Width = 110 };
-    private readonly CheckBox _alwaysEquip = new() { Text = "Всегда надевать амулет (не доверять состоянию)", AutoSize = true };
     private readonly CheckBox _startMinimized = new() { Text = "Запускать свёрнутым в трей", AutoSize = true };
     private readonly CheckBox _overlayVisible = new() { Text = "Оверлей-бар", AutoSize = true };
     private readonly TrackBar _overlayOpacity = new() { Minimum = 20, Maximum = 100, TickFrequency = 10, Width = 140, AutoSize = false, Height = 30 };
@@ -142,7 +141,7 @@ public sealed class MainForm : Form
             L("Клавиша вкл/выкл макросов:"), _toggleKey,
             L("   Длительность нажатия:"), _holdMs, L("мс (если игра не видит нажатия — увеличьте до 40–60)")));
         settings.Controls.Add(Flow(
-            _alwaysEquip, B("Сбросить состояние амулета", (_, _) => _engine.ResetAmuletState()), _startMinimized));
+            B("Сбросить состояние амулета (считать, что ничего не надето)", (_, _) => _engine.ResetAmuletState()), _startMinimized));
         settings.Controls.Add(Flow(
             _overlayVisible, L("  Непрозрачность:"), _overlayOpacity, _overlayLocked));
         var settingsBox = new GroupBox { Text = "Настройки", Dock = DockStyle.Fill, AutoSize = true };
@@ -230,7 +229,6 @@ public sealed class MainForm : Form
         _inputMode.SelectedIndexChanged += (_, _) => Change(() => _config.InputMode = (InputMode)_inputMode.SelectedIndex);
         _holdMs.ValueChanged += (_, _) => Change(() => _config.KeyHoldMs = (int)_holdMs.Value);
         _toggleKey.ValueChanged += (_, _) => Change(() => _config.ToggleKey = _toggleKey.Value == Keys.None ? Keys.Pause : _toggleKey.Value);
-        _alwaysEquip.CheckedChanged += (_, _) => Change(() => _config.AlwaysEquip = _alwaysEquip.Checked);
         _startMinimized.CheckedChanged += (_, _) => Change(() => _config.StartMinimized = _startMinimized.Checked);
         _logEnabled.CheckedChanged += (_, _) => Change(() => _config.LogEnabled = _logEnabled.Checked);
         _overlayVisible.CheckedChanged += (_, _) => Change(() => _config.Overlay.Visible = _overlayVisible.Checked);
@@ -275,7 +273,6 @@ public sealed class MainForm : Form
             _inputMode.SelectedIndex = (int)_config.InputMode;
             _holdMs.Value = Math.Clamp(_config.KeyHoldMs, AppConfig.MinHoldMs, AppConfig.MaxHoldMs);
             _toggleKey.Value = _config.ToggleKey;
-            _alwaysEquip.Checked = _config.AlwaysEquip;
             _startMinimized.Checked = _config.StartMinimized;
             _logEnabled.Checked = _config.LogEnabled;
             _overlayVisible.Checked = _config.Overlay.Visible;

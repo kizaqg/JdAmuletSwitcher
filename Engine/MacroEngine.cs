@@ -36,7 +36,8 @@ public enum MacroJobKind : byte
     SkillUp,        // отпустить скилл (не раньше минимального удержания)
     Equip,          // только надеть амулет (кнопка бара / комбинация)
     Test,           // SkillDown + SkillUp
-    ManualEquip,
+    ManualEquip,    // игрок сам нажал клавишу амулета
+    MarkEquipped,   // правый клик на панели: считать амулет надетым, ничего не нажимая
     EnabledChanged,
     ResetState,
 }
@@ -76,7 +77,6 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
         public FrozenDictionary<int, CompiledGroup> Combos = FrozenDictionary<int, CompiledGroup>.Empty;   // (mods<<16)|скан-код → амулет
         public bool[] IsAmulet = new bool[0x200];
         public CompiledGroup[] Groups = Array.Empty<CompiledGroup>();
-        public bool AlwaysEquip;
         public long HoldTicks = PrecisionDelay.MsToTicks(30);
         public uint ToggleVk = (uint)Keys.Pause;
     }
@@ -231,7 +231,6 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
             Combos = combos.ToFrozenDictionary(),
             IsAmulet = isAmulet,
             Groups = groups.ToArray(),
-            AlwaysEquip = cfg.AlwaysEquip,
             HoldTicks = PrecisionDelay.MsToTicks(Math.Clamp(cfg.KeyHoldMs, AppConfig.MinHoldMs, AppConfig.MaxHoldMs)),
             ToggleVk = toggleVk,
         };
@@ -341,6 +340,10 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
         else _sender.Post(new MacroJob(MacroJobKind.Equip, Stopwatch.GetTimestamp(), group: g));
     }
 
+    /// <summary>Синхронизация с игрой: считать амулет надетым, клавишу не нажимать.</summary>
+    public void MarkEquipped(CompiledGroup g) =>
+        _sender.Post(new MacroJob(MacroJobKind.MarkEquipped, Stopwatch.GetTimestamp(), group: g));
+
     public void ResetAmuletState() =>
         _sender.Post(new MacroJob(MacroJobKind.ResetState, Stopwatch.GetTimestamp()));
 
@@ -370,11 +373,22 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
                 break;
 
             case MacroJobKind.ManualEquip:
-                if (_currentAmulet != job.Scan)
+                // В игре повторное нажатие клавиши надетого амулета снимает его
+                if (_currentAmulet == job.Scan)
+                {
+                    SetCurrentAmulet(0);
+                    Log($"Амулет {AmuletName(job.Scan)} снят вручную (повторное нажатие его клавиши).");
+                }
+                else
                 {
                     SetCurrentAmulet(job.Scan);
                     Log($"Амулет надет вручную: {AmuletName(job.Scan)}");
                 }
+                break;
+
+            case MacroJobKind.MarkEquipped:
+                SetCurrentAmulet(job.Group!.Amulet.Scan);
+                Log($"Отмечено: надет амулет {KeyCodes.Display(job.Group.AmuletKey)} (клавиша не нажималась).");
                 break;
 
             case MacroJobKind.EnabledChanged:
@@ -405,7 +419,8 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
         }
 
         long start = Stopwatch.GetTimestamp();
-        bool needAmulet = s.AlwaysEquip || _currentAmulet != g.Amulet.Scan;
+        // Клавишу амулета жмём только при смене амулета: повторное нажатие в игре снимает надетый амулет
+        bool needAmulet = _currentAmulet != g.Amulet.Scan;
         bool ok;
         double pauseMs = 0;
         Span<KeyAction> a = stackalloc KeyAction[2];
@@ -477,6 +492,11 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
 
     private void EquipAmulet(CompiledGroup g, int releaseMods, long jobTs)
     {
+        if (_currentAmulet == g.Amulet.Scan)
+        {
+            Log($"Амулет {KeyCodes.Display(g.AmuletKey)} уже надет — клавиша не нажата (иначе игра его снимет).");
+            return;
+        }
         nint game = _tracker.GameHwnd;
         Span<KeyAction> a = stackalloc KeyAction[1];
         a[0] = KeyAction.Down(g.Amulet);
