@@ -8,24 +8,34 @@ using JdAmulet.Native;
 
 namespace JdAmulet.Engine;
 
-/// <summary>Связка, подготовленная к работе (скан-коды и задержка в тиках Stopwatch).</summary>
-public sealed class CompiledBinding
+/// <summary>Амулет и его скиллы, подготовленные к работе.</summary>
+public sealed class CompiledGroup
 {
     public required string Name { get; init; }
-    public required KeyStroke Skill { get; init; }   // пусто у «основного амулета»
+    /// <summary>Подпись на панели: своё название или клавиша амулета.</summary>
+    public required string ShortLabel { get; init; }
     public required KeyStroke Amulet { get; init; }
-    public required Keys SkillKey { get; init; }
     public required Keys AmuletKey { get; init; }
+    public required Keys[] SkillKeys { get; init; }
     public required Keys Hotkey { get; init; }
     public required int DelayMs { get; init; }
     public required long DelayTicks { get; init; }
-    public bool IsMain { get; init; }
+}
+
+/// <summary>Клавиша скилла, привязанная к амулету.</summary>
+public sealed class CompiledSkill
+{
+    public required CompiledGroup Group { get; init; }
+    public required KeyStroke Skill { get; init; }
+    public required Keys SkillKey { get; init; }
 }
 
 public enum MacroJobKind : byte
 {
-    Binding,
-    SkillOnly,
+    SkillDown,      // надеть амулет (если нужно) → нажать скилл (без отпускания)
+    SkillUp,        // отпустить скилл (не раньше минимального удержания)
+    Equip,          // только надеть амулет (кнопка бара / комбинация)
+    Test,           // SkillDown + SkillUp
     ManualEquip,
     EnabledChanged,
     ResetState,
@@ -34,42 +44,40 @@ public enum MacroJobKind : byte
 public readonly struct MacroJob
 {
     public readonly MacroJobKind Kind;
-    public readonly CompiledBinding? Binding;
+    public readonly CompiledSkill? Skill;
+    public readonly CompiledGroup? Group;
     public readonly ushort Scan;
     public readonly byte ReleaseMods;
-    public readonly bool IsTest;
     public readonly long Timestamp;
 
-    public MacroJob(MacroJobKind kind, CompiledBinding? binding, ushort scan, int releaseMods, long timestamp, bool isTest = false)
+    public MacroJob(MacroJobKind kind, long timestamp, CompiledSkill? skill = null, CompiledGroup? group = null,
+        ushort scan = 0, int releaseMods = 0)
     {
         Kind = kind;
-        Binding = binding;
+        Timestamp = timestamp;
+        Skill = skill;
+        Group = group;
         Scan = scan;
         ReleaseMods = (byte)releaseMods;
-        Timestamp = timestamp;
-        IsTest = isTest;
     }
 }
 
 public readonly record struct LogEntry(DateTime Time, string Text);
 
 /// <summary>
-/// Ядро: логика хука (поток хука) + выполнение связок (поток ввода).
+/// Ядро: логика хука (поток хука) + выполнение (поток ввода).
 /// Конфигурация — неизменяемый снимок, подменяемый атомарно.
 /// </summary>
 public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob>, IDisposable
 {
     private sealed class Snapshot
     {
-        public static readonly Snapshot Empty = new();
-
-        public FrozenDictionary<int, CompiledBinding> Triggers = FrozenDictionary<int, CompiledBinding>.Empty; // скан-код → связка
-        public FrozenDictionary<int, CompiledBinding> Combos = FrozenDictionary<int, CompiledBinding>.Empty;   // (mods<<16)|скан-код → связка
+        public FrozenDictionary<int, CompiledSkill> Triggers = FrozenDictionary<int, CompiledSkill>.Empty; // скан-код → скилл
+        public FrozenDictionary<int, CompiledGroup> Combos = FrozenDictionary<int, CompiledGroup>.Empty;   // (mods<<16)|скан-код → амулет
         public bool[] IsAmulet = new bool[0x200];
-        public CompiledBinding[] Bindings = Array.Empty<CompiledBinding>();
-        public CompiledBinding? Main;
-        public RepeatMode Repeat;
+        public CompiledGroup[] Groups = Array.Empty<CompiledGroup>();
         public bool AlwaysEquip;
+        public long HoldTicks = PrecisionDelay.MsToTicks(30);
         public uint ToggleVk = (uint)Keys.Pause;
     }
 
@@ -77,19 +85,21 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
     private readonly InputSender<MacroJob> _sender;
     private readonly Action<Action> _postToUi;
 
-    private volatile Snapshot _snap = Snapshot.Empty;
+    private volatile Snapshot _snap = new();
     private volatile bool _enabled = true;
     private volatile bool _logEnabled = true;
 
     // --- состояние потока хука ---
-    private readonly bool[] _held = new bool[0x200];                       // нажатие подавлено → подавить и автоповтор, и key-up
-    private readonly CompiledBinding?[] _heldBinding = new CompiledBinding?[0x200];
+    private readonly bool[] _held = new bool[0x200];                    // нажатие подавлено → подавить и автоповтор, и key-up
+    private readonly CompiledSkill?[] _heldSkill = new CompiledSkill?[0x200];
     private bool _toggleHeld;
-    private int _mods;                                                     // физически зажатые модификаторы (ModBits)
+    private int _mods;                                                  // физически зажатые модификаторы (ModBits)
 
     // --- состояние потока ввода ---
     private ushort _currentAmulet;
     private volatile int _currentPublished;
+    private readonly long[] _skillDownAt = new long[0x200];
+    private readonly bool[] _skillIsDown = new bool[0x200];
 
     // --- лог ---
     private readonly ConcurrentQueue<LogEntry> _logQueue = new();
@@ -114,17 +124,15 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
         {
             if (_enabled == value) return;
             _enabled = value;
-            _sender.Post(new MacroJob(MacroJobKind.EnabledChanged, null, 0, 0, Stopwatch.GetTimestamp()));
+            _sender.Post(new MacroJob(MacroJobKind.EnabledChanged, Stopwatch.GetTimestamp()));
         }
     }
 
-    public bool LogEnabled { get => _logEnabled; set => _logEnabled = value; }
     public int CurrentAmulet => _currentPublished;
     public string TimerMode => _sender.Delay.Mode;
-    public IReadOnlyList<CompiledBinding> Bindings => _snap.Bindings;
-    public CompiledBinding? MainAmulet => _snap.Main;
+    public IReadOnlyList<CompiledGroup> Groups => _snap.Groups;
 
-    /// <summary>Скан-коды всех клавиш конфигурации — для аварийного отпускания при падении.</summary>
+    /// <summary>Скан-коды всех клавиш конфигурации — для аварийного отпускания.</summary>
     public ReadOnlySpan<ushort> UsedScans => _usedScans;
 
     // ===================================================================================
@@ -135,109 +143,83 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
     {
         var warnings = new List<string>();
         Profile p = cfg.GetActiveProfile();
-        var triggers = new Dictionary<int, CompiledBinding>();
-        var combos = new Dictionary<int, CompiledBinding>();
+        var triggers = new Dictionary<int, CompiledSkill>();
+        var combos = new Dictionary<int, CompiledGroup>();
         var isAmulet = new bool[0x200];
-        var list = new List<CompiledBinding>();
+        var groups = new List<CompiledGroup>();
         var scans = new HashSet<ushort>();
         uint toggleVk = (uint)(cfg.ToggleKey & Keys.KeyCode);
+        var amuletOwner = new Dictionary<ushort, string>();
 
-        void AddCombo(Keys hotkey, CompiledBinding cb)
+        foreach (AmuletGroup g in p.Groups)
         {
-            KeyStroke ks = KeyStroke.From(hotkey);
-            if (ks.IsEmpty) return;
-            int mods = KeyCodes.ModsOf(hotkey);
-            if ((uint)(hotkey & Keys.KeyCode) == toggleVk)
+            if (!g.Enabled) continue;
+            string name = g.DisplayName;
+            KeyStroke amulet = KeyStroke.From(g.AmuletKey);
+            if (amulet.IsEmpty)
             {
-                warnings.Add($"«{cb.Name}»: комбинация совпадает с клавишей вкл/выкл — пропущена.");
-                return;
-            }
-            if (mods == 0 && triggers.ContainsKey(ks.Scan))
-            {
-                warnings.Add($"«{cb.Name}»: комбинация {KeyCodes.Display(hotkey)} совпадает с клавишей скилла — пропущена.");
-                return;
-            }
-            if (!combos.TryAdd((mods << 16) | ks.Scan, cb))
-                warnings.Add($"«{cb.Name}»: комбинация {KeyCodes.Display(hotkey)} уже занята — пропущена.");
-        }
-
-        foreach (BindingConfig b in p.Bindings)
-        {
-            if (!b.Enabled) continue;
-            KeyStroke skill = KeyStroke.From(b.SkillKey);
-            KeyStroke amulet = KeyStroke.From(b.AmuletKey);
-            if (skill.IsEmpty || amulet.IsEmpty)
-            {
-                warnings.Add($"«{b.Name}»: не задана клавиша скилла или амулета — связка пропущена.");
+                warnings.Add($"«{name}»: не задана клавиша амулета — пропущено.");
                 continue;
             }
-            if (skill.Scan == amulet.Scan)
+            if (!amuletOwner.TryAdd(amulet.Scan, name))
             {
-                warnings.Add($"«{b.Name}»: скилл и амулет на одной клавише — связка пропущена.");
-                continue;
-            }
-            if ((uint)(b.SkillKey & Keys.KeyCode) == toggleVk)
-            {
-                warnings.Add($"«{b.Name}»: клавиша скилла совпадает с клавишей вкл/выкл — связка пропущена.");
+                warnings.Add($"«{name}»: амулет {KeyCodes.Display(g.AmuletKey)} уже есть в «{amuletOwner[amulet.Scan]}» — объедините скиллы в одну строку.");
                 continue;
             }
 
-            int delay = Math.Clamp(b.DelayMs, 0, AppConfig.MaxDelayMs);
-            var cb = new CompiledBinding
+            int delay = Math.Clamp(g.DelayMs, 0, AppConfig.MaxDelayMs);
+            var cg = new CompiledGroup
             {
-                Name = b.Name,
-                Skill = skill,
+                Name = name,
+                ShortLabel = string.IsNullOrWhiteSpace(g.Name) ? KeyCodes.Display(g.AmuletKey) : g.Name.Trim(),
                 Amulet = amulet,
-                SkillKey = b.SkillKey & Keys.KeyCode,
-                AmuletKey = b.AmuletKey & Keys.KeyCode,
-                Hotkey = b.Hotkey,
+                AmuletKey = g.AmuletKey & Keys.KeyCode,
+                SkillKeys = g.SkillKeys.Select(k => k & Keys.KeyCode).Where(k => k != Keys.None).Distinct().ToArray(),
+                Hotkey = g.Hotkey,
                 DelayMs = delay,
                 DelayTicks = PrecisionDelay.MsToTicks(delay),
             };
-            if (!triggers.TryAdd(skill.Scan, cb))
-            {
-                warnings.Add($"«{b.Name}»: клавиша {KeyCodes.Display(b.SkillKey)} уже используется другой связкой — пропущена.");
-                continue;
-            }
-            list.Add(cb);
+            groups.Add(cg);
             isAmulet[amulet.Scan] = true;
-            scans.Add(skill.Scan);
             scans.Add(amulet.Scan);
-        }
 
-        foreach (CompiledBinding cb in list)
-        {
-            if (triggers.ContainsKey(cb.Amulet.Scan))
-                warnings.Add($"«{cb.Name}»: клавиша амулета {KeyCodes.Display(cb.AmuletKey)} совпадает со скиллом другой связки.");
-            AddCombo(cb.Hotkey, cb);
-        }
-
-        CompiledBinding? main = null;
-        if (p.MainAmulet.Enabled)
-        {
-            KeyStroke am = KeyStroke.From(p.MainAmulet.AmuletKey);
-            if (am.IsEmpty)
+            foreach (Keys sk in cg.SkillKeys)
             {
-                warnings.Add("Основной амулет: не задана клавиша.");
-            }
-            else
-            {
-                main = new CompiledBinding
+                KeyStroke skill = KeyStroke.From(sk);
+                if (skill.IsEmpty) continue;
+                if (skill.Scan == amulet.Scan)
                 {
-                    Name = string.IsNullOrWhiteSpace(p.MainAmulet.Name) ? "Основной" : p.MainAmulet.Name,
-                    Skill = default,
-                    Amulet = am,
-                    SkillKey = Keys.None,
-                    AmuletKey = p.MainAmulet.AmuletKey & Keys.KeyCode,
-                    Hotkey = p.MainAmulet.Hotkey,
-                    DelayMs = 0,
-                    DelayTicks = 0,
-                    IsMain = true,
-                };
-                isAmulet[am.Scan] = true;
-                scans.Add(am.Scan);
-                AddCombo(main.Hotkey, main);
+                    warnings.Add($"«{name}»: скилл {KeyCodes.Display(sk)} на клавише самого амулета — пропущен.");
+                    continue;
+                }
+                if ((uint)sk == toggleVk)
+                {
+                    warnings.Add($"«{name}»: скилл {KeyCodes.Display(sk)} совпадает с клавишей вкл/выкл — пропущен.");
+                    continue;
+                }
+                if (!triggers.TryAdd(skill.Scan, new CompiledSkill { Group = cg, Skill = skill, SkillKey = sk }))
+                {
+                    warnings.Add($"«{name}»: скилл {KeyCodes.Display(sk)} уже привязан к «{triggers[skill.Scan].Group.Name}» — пропущен.");
+                    continue;
+                }
+                scans.Add(skill.Scan);
             }
+        }
+
+        foreach (CompiledGroup cg in groups)
+        {
+            if (triggers.TryGetValue(cg.Amulet.Scan, out CompiledSkill? clash))
+                warnings.Add($"«{cg.Name}»: клавиша амулета {KeyCodes.Display(cg.AmuletKey)} — это скилл в «{clash.Group.Name}».");
+
+            KeyStroke hk = KeyStroke.From(cg.Hotkey);
+            if (hk.IsEmpty) continue;
+            int mods = KeyCodes.ModsOf(cg.Hotkey);
+            if ((uint)(cg.Hotkey & Keys.KeyCode) == toggleVk)
+                warnings.Add($"«{cg.Name}»: комбинация совпадает с клавишей вкл/выкл — пропущена.");
+            else if (mods == 0 && triggers.ContainsKey(hk.Scan))
+                warnings.Add($"«{cg.Name}»: комбинация {KeyCodes.Display(cg.Hotkey)} совпадает со скиллом — пропущена.");
+            else if (!combos.TryAdd((mods << 16) | hk.Scan, cg))
+                warnings.Add($"«{cg.Name}»: комбинация {KeyCodes.Display(cg.Hotkey)} уже занята — пропущена.");
         }
 
         _sender.Mode = cfg.InputMode;
@@ -248,10 +230,9 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
             Triggers = triggers.ToFrozenDictionary(),
             Combos = combos.ToFrozenDictionary(),
             IsAmulet = isAmulet,
-            Bindings = list.ToArray(),
-            Main = main,
-            Repeat = cfg.RepeatMode,
+            Groups = groups.ToArray(),
             AlwaysEquip = cfg.AlwaysEquip,
+            HoldTicks = PrecisionDelay.MsToTicks(Math.Clamp(cfg.KeyHoldMs, AppConfig.MinHoldMs, AppConfig.MaxHoldMs)),
             ToggleVk = toggleVk,
         };
         return warnings;
@@ -284,8 +265,10 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
             if (_held[sc])
             {
                 _held[sc] = false;
-                _heldBinding[sc] = null;
-                return true; // key-up исходной клавиши подавляем вместе с её key-down
+                CompiledSkill? hs = _heldSkill[sc];
+                _heldSkill[sc] = null;
+                if (hs != null) _sender.Post(new MacroJob(MacroJobKind.SkillUp, ts, skill: hs));
+                return true; // отпускание скилла отправит поток ввода — строго после нажатия
             }
             return false;
         }
@@ -297,20 +280,13 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
             {
                 _toggleHeld = true;
                 _enabled = !_enabled;
-                _sender.Post(new MacroJob(MacroJobKind.EnabledChanged, null, 0, 0, ts));
+                _sender.Post(new MacroJob(MacroJobKind.EnabledChanged, ts));
             }
             return false;
         }
 
-        // Автоповтор клавиши, чьё нажатие мы уже подавили. Проверяется ДО проверки вкл/фокуса,
-        // иначе повторы ушли бы в игру без парного key-up.
-        if (_held[sc])
-        {
-            CompiledBinding? hb = _heldBinding[sc];
-            if (hb != null && s.Repeat == RepeatMode.SkillOnly && _enabled)
-                _sender.Post(new MacroJob(MacroJobKind.SkillOnly, hb, 0, 0, ts));
-            return true;
-        }
+        // Автоповтор удерживаемой клавиши: скилл уже нажат синтетически и держится до отпускания
+        if (_held[sc]) return true;
 
         nint game = _tracker.GameHwnd;
         if (game == 0 || NativeMethods.GetForegroundWindow() != game) return false;
@@ -322,45 +298,51 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
         {
             // Макросы выключены, но ручную смену амулета всё равно запоминаем
             if (mods == 0 && s.IsAmulet[sc])
-                _sender.Post(new MacroJob(MacroJobKind.ManualEquip, null, (ushort)sc, 0, ts));
+                _sender.Post(new MacroJob(MacroJobKind.ManualEquip, ts, scan: (ushort)sc));
             return false;
         }
 
-        if (mods == 0)
-        {
-            if (s.Triggers.TryGetValue(sc, out CompiledBinding? b))
-            {
-                _held[sc] = true;
-                _heldBinding[sc] = b;
-                _sender.Post(new MacroJob(MacroJobKind.Binding, b, 0, 0, ts));
-                return true;
-            }
-        }
-
-        if (s.Combos.TryGetValue((mods << 16) | sc, out CompiledBinding? c))
+        if (mods == 0 && s.Triggers.TryGetValue(sc, out CompiledSkill? skill))
         {
             _held[sc] = true;
-            _heldBinding[sc] = null; // повторы комбинации просто подавляются
-            _sender.Post(new MacroJob(MacroJobKind.Binding, c, 0, _mods, ts));
+            _heldSkill[sc] = skill;
+            _sender.Post(new MacroJob(MacroJobKind.SkillDown, ts, skill: skill));
+            return true;
+        }
+
+        if (s.Combos.TryGetValue((mods << 16) | sc, out CompiledGroup? g))
+        {
+            _held[sc] = true;
+            _heldSkill[sc] = null; // повторы и отпускание комбинации просто подавляются
+            _sender.Post(new MacroJob(MacroJobKind.Equip, ts, group: g, releaseMods: _mods));
             return true;
         }
 
         // Игрок сам нажал клавишу амулета — обновим состояние, нажатие пропускаем в игру
         if (mods == 0 && s.IsAmulet[sc])
-            _sender.Post(new MacroJob(MacroJobKind.ManualEquip, null, (ushort)sc, 0, ts));
+            _sender.Post(new MacroJob(MacroJobKind.ManualEquip, ts, scan: (ushort)sc));
 
         return false;
     }
 
     // ===================================================================================
-    // Команды из UI (кнопки бара, тест)
+    // Команды из UI
     // ===================================================================================
 
-    public void Run(CompiledBinding b, bool isTest = false) =>
-        _sender.Post(new MacroJob(MacroJobKind.Binding, b, 0, Volatile.Read(ref _mods), Stopwatch.GetTimestamp(), isTest));
+    /// <summary>Надеть амулет (кнопка на баре).</summary>
+    public void Equip(CompiledGroup g) =>
+        _sender.Post(new MacroJob(MacroJobKind.Equip, Stopwatch.GetTimestamp(), group: g, releaseMods: Volatile.Read(ref _mods)));
+
+    /// <summary>Тест: амулет → пауза → скилл (нажать и отпустить).</summary>
+    public void Test(CompiledGroup g)
+    {
+        CompiledSkill? skill = _snap.Triggers.Values.FirstOrDefault(x => x.Group == g);
+        if (skill != null) _sender.Post(new MacroJob(MacroJobKind.Test, Stopwatch.GetTimestamp(), skill: skill));
+        else _sender.Post(new MacroJob(MacroJobKind.Equip, Stopwatch.GetTimestamp(), group: g));
+    }
 
     public void ResetAmuletState() =>
-        _sender.Post(new MacroJob(MacroJobKind.ResetState, null, 0, 0, Stopwatch.GetTimestamp()));
+        _sender.Post(new MacroJob(MacroJobKind.ResetState, Stopwatch.GetTimestamp()));
 
     // ===================================================================================
     // Поток ввода
@@ -370,20 +352,28 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
     {
         switch (job.Kind)
         {
-            case MacroJobKind.Binding:
-                RunBinding(in job);
+            case MacroJobKind.SkillDown:
+                SkillDown(job.Skill!, job.Timestamp, test: false);
                 break;
 
-            case MacroJobKind.SkillOnly:
-                if (!_sender.Send(job.Binding!.Skill, default, 0, 0, _tracker.GameHwnd))
-                    Log($"Ошибка отправки ввода (код {_sender.LastError}).");
+            case MacroJobKind.SkillUp:
+                SkillUp(job.Skill!);
+                break;
+
+            case MacroJobKind.Test:
+                if (SkillDown(job.Skill!, job.Timestamp, test: true))
+                    SkillUp(job.Skill!);
+                break;
+
+            case MacroJobKind.Equip:
+                EquipAmulet(job.Group!, job.ReleaseMods, job.Timestamp);
                 break;
 
             case MacroJobKind.ManualEquip:
                 if (_currentAmulet != job.Scan)
                 {
                     SetCurrentAmulet(job.Scan);
-                    Log($"Амулет надет вручную: {ScanName(job.Scan)}");
+                    Log($"Амулет надет вручную: {AmuletName(job.Scan)}");
                 }
                 break;
 
@@ -400,69 +390,107 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
         }
     }
 
-    private void RunBinding(in MacroJob job)
+    /// <summary>Амулет (нажать → удержать → отпустить) → пауза → скилл нажат и удерживается.</summary>
+    private bool SkillDown(CompiledSkill sk, long jobTs, bool test)
     {
-        CompiledBinding b = job.Binding!;
+        CompiledGroup g = sk.Group;
         Snapshot s = _snap;
         nint game = _tracker.GameHwnd;
 
-        if (job.IsTest && _sender.Mode == InputMode.SendInput &&
+        if (test && _sender.Mode == InputMode.SendInput &&
             (game == 0 || NativeMethods.GetForegroundWindow() != game))
         {
-            Log($"Тест «{b.Name}»: окно игры не активно — нажатия не отправлены.");
-            return;
+            Log($"Тест «{g.Name}»: окно игры не активно — нажатия не отправлены.");
+            return false;
         }
 
         long start = Stopwatch.GetTimestamp();
-        int release = job.ReleaseMods;
-        bool needAmulet = b.IsMain || s.AlwaysEquip || _currentAmulet != b.Amulet.Scan;
+        bool needAmulet = s.AlwaysEquip || _currentAmulet != g.Amulet.Scan;
         bool ok;
         double pauseMs = 0;
+        Span<KeyAction> a = stackalloc KeyAction[2];
 
         if (!needAmulet)
         {
-            ok = _sender.Send(b.Skill, default, release, RestoreMask(release), game);
-        }
-        else if (b.Skill.IsEmpty || b.DelayTicks == 0)
-        {
-            // Задержка 0: все четыре события одним вызовом SendInput
-            ok = _sender.Send(b.Amulet, b.Skill, release, RestoreMask(release), game);
+            a[0] = KeyAction.Down(sk.Skill);
+            ok = _sender.Send(a[..1], 0, 0, game);
         }
         else
         {
-            ok = _sender.Send(b.Amulet, default, release, 0, game);
-            if (ok)
+            a[0] = KeyAction.Down(g.Amulet);
+            ok = _sender.Send(a[..1], 0, 0, game);
+            long amuletDown = Stopwatch.GetTimestamp();
+            _sender.Delay.WaitUntil(amuletDown + s.HoldTicks);   // игра должна «увидеть» нажатие в своём кадре
+
+            a[0] = KeyAction.Release(g.Amulet);
+            if (g.DelayTicks == 0)
             {
-                long amuletSent = Stopwatch.GetTimestamp();
-                _sender.Delay.WaitUntil(amuletSent + b.DelayTicks);
-                long skillStart = Stopwatch.GetTimestamp();
-                pauseMs = PrecisionDelay.TicksToMs(skillStart - amuletSent);
-                ok = _sender.Send(b.Skill, default, 0, RestoreMask(release), game);
+                a[1] = KeyAction.Down(sk.Skill);
+                ok &= _sender.Send(a, 0, 0, game);
             }
+            else
+            {
+                ok &= _sender.Send(a[..1], 0, 0, game);
+                long amuletUp = Stopwatch.GetTimestamp();
+                _sender.Delay.WaitUntil(amuletUp + g.DelayTicks);
+                pauseMs = PrecisionDelay.TicksToMs(Stopwatch.GetTimestamp() - amuletUp);
+                a[0] = KeyAction.Down(sk.Skill);
+                ok &= _sender.Send(a[..1], 0, 0, game);
+            }
+            if (ok) SetCurrentAmulet(g.Amulet.Scan);
         }
 
         long end = Stopwatch.GetTimestamp();
-        if (ok && needAmulet) SetCurrentAmulet(b.Amulet.Scan);
+        _skillDownAt[sk.Skill.Scan] = end;
+        _skillIsDown[sk.Skill.Scan] = true;
 
-        if (!_logEnabled && ok) return;
-
-        double total = PrecisionDelay.TicksToMs(end - job.Timestamp);
-        double queue = PrecisionDelay.TicksToMs(start - job.Timestamp);
-        string prefix = job.IsTest ? "Тест " : "";
         if (!ok)
-            Log($"{prefix}«{b.Name}»: ОШИБКА отправки ввода (код {_sender.LastError}). Попробуйте другой режим ввода.");
-        else if (b.IsMain)
-            Log($"{prefix}«{b.Name}»: амулет {KeyCodes.Display(b.AmuletKey)} | {total:F2} мс");
-        else if (!needAmulet)
-            Log($"{prefix}«{b.Name}»: амулет уже надет → скилл {KeyCodes.Display(b.SkillKey)} | до скилла {total:F2} мс (очередь {queue:F3})");
-        else if (b.DelayTicks == 0)
-            Log($"{prefix}«{b.Name}»: амулет {KeyCodes.Display(b.AmuletKey)} + скилл {KeyCodes.Display(b.SkillKey)} одним пакетом | до скилла {total:F2} мс (очередь {queue:F3})");
+        {
+            Log($"«{g.Name}»: ОШИБКА отправки ввода (код {_sender.LastError}). Попробуйте другой режим ввода.");
+            return true;
+        }
+        if (!_logEnabled) return true;
+
+        double total = PrecisionDelay.TicksToMs(end - jobTs);
+        double queue = PrecisionDelay.TicksToMs(start - jobTs);
+        string prefix = test ? "Тест: " : "";
+        string skillName = KeyCodes.Display(sk.SkillKey);
+        if (!needAmulet)
+            Log($"{prefix}скилл {skillName} (амулет {KeyCodes.Display(g.AmuletKey)} уже надет) | до скилла {total:F2} мс");
+        else if (g.DelayTicks == 0)
+            Log($"{prefix}амулет {KeyCodes.Display(g.AmuletKey)} → скилл {skillName} без паузы | до скилла {total:F2} мс (очередь {queue:F3})");
         else
-            Log($"{prefix}«{b.Name}»: амулет {KeyCodes.Display(b.AmuletKey)} → пауза {pauseMs:F2} мс (задано {b.DelayMs}) → скилл {KeyCodes.Display(b.SkillKey)} | до скилла {total:F2} мс (очередь {queue:F3})");
+            Log($"{prefix}амулет {KeyCodes.Display(g.AmuletKey)} → пауза {pauseMs:F1} мс (задано {g.DelayMs}) → скилл {skillName} | до скилла {total:F2} мс (очередь {queue:F3})");
+        return true;
     }
 
-    /// <summary>Какие из отпущенных модификаторов вернуть: только те, что игрок всё ещё держит.</summary>
-    private int RestoreMask(int released) => released & Volatile.Read(ref _mods);
+    private void SkillUp(CompiledSkill sk)
+    {
+        ushort sc = sk.Skill.Scan;
+        if (!_skillIsDown[sc]) return;
+        _sender.Delay.WaitUntil(_skillDownAt[sc] + _snap.HoldTicks); // короткий тап всё равно держим минимум KeyHoldMs
+        Span<KeyAction> a = stackalloc KeyAction[1];
+        a[0] = KeyAction.Release(sk.Skill);
+        _sender.Send(a, 0, 0, _tracker.GameHwnd);
+        _skillIsDown[sc] = false;
+    }
+
+    private void EquipAmulet(CompiledGroup g, int releaseMods, long jobTs)
+    {
+        nint game = _tracker.GameHwnd;
+        Span<KeyAction> a = stackalloc KeyAction[1];
+        a[0] = KeyAction.Down(g.Amulet);
+        bool ok = _sender.Send(a, releaseMods, 0, game);
+        _sender.Delay.WaitUntil(Stopwatch.GetTimestamp() + _snap.HoldTicks);
+        a[0] = KeyAction.Release(g.Amulet);
+        ok &= _sender.Send(a, 0, releaseMods & Volatile.Read(ref _mods), game);
+
+        if (ok) SetCurrentAmulet(g.Amulet.Scan);
+        if (!ok)
+            Log($"«{g.Name}»: ОШИБКА отправки ввода (код {_sender.LastError}). Попробуйте другой режим ввода.");
+        else if (_logEnabled)
+            Log($"Амулет {KeyCodes.Display(g.AmuletKey)} надет ({g.Name}) | {PrecisionDelay.TicksToMs(Stopwatch.GetTimestamp() - jobTs):F2} мс");
+    }
 
     private void SetCurrentAmulet(ushort scan)
     {
@@ -472,12 +500,10 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
         _postToUi(() => AmuletChanged?.Invoke(scan));
     }
 
-    private string ScanName(ushort scan)
+    private string AmuletName(ushort scan)
     {
-        Snapshot s = _snap;
-        foreach (CompiledBinding b in s.Bindings)
-            if (b.Amulet.Scan == scan) return KeyCodes.Display(b.AmuletKey);
-        if (s.Main != null && s.Main.Amulet.Scan == scan) return KeyCodes.Display(s.Main.AmuletKey);
+        foreach (CompiledGroup g in _snap.Groups)
+            if (g.Amulet.Scan == scan) return KeyCodes.Display(g.AmuletKey);
         return $"sc 0x{scan:X}";
     }
 
@@ -501,5 +527,10 @@ public sealed class MacroEngine : ILowLevelKeyHandler, IInputJobHandler<MacroJob
             Logged?.Invoke(e);
     }
 
-    public void Dispose() => _sender.Dispose();
+    public void Dispose()
+    {
+        _sender.Dispose();
+        // Скилл мог остаться нажатым синтетически (игрок держал клавишу при выходе)
+        InputSender<MacroJob>.ReleaseKeys(_usedScans);
+    }
 }

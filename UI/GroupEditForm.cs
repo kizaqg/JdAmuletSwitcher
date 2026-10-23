@@ -3,24 +3,25 @@ using JdAmulet.Input;
 
 namespace JdAmulet.UI;
 
-public sealed class BindingEditForm : Form
+/// <summary>Редактирование строки «амулет → скиллы».</summary>
+public sealed class GroupEditForm : Form
 {
-    private readonly TextBox _name = new() { Dock = DockStyle.Fill };
-    private readonly KeyCaptureBox _skill = new() { Dock = DockStyle.Fill };
     private readonly KeyCaptureBox _amulet = new() { Dock = DockStyle.Fill };
+    private readonly MultiKeyCaptureBox _skills = new() { Dock = DockStyle.Fill };
+    private readonly TextBox _name = new() { Dock = DockStyle.Fill, PlaceholderText = "необязательно" };
     private readonly KeyCaptureBox _hotkey = new() { Dock = DockStyle.Fill, AllowModifiers = true };
     private readonly TrackBar _delay = new() { Minimum = 0, Maximum = AppConfig.MaxDelayMs, TickFrequency = 10, SmallChange = 1, LargeChange = 10, Dock = DockStyle.Fill };
     private readonly NumericUpDown _delayNum = new() { Minimum = 0, Maximum = AppConfig.MaxDelayMs, Width = 64 };
-    private readonly CheckBox _enabled = new() { Text = "Связка включена", AutoSize = true };
-    private readonly Label _hint = new() { AutoSize = true, ForeColor = Color.DarkOrange, MaximumSize = new Size(420, 0) };
+    private readonly CheckBox _enabled = new() { Text = "Включено", AutoSize = true };
+    private readonly Label _hint = new() { AutoSize = true, ForeColor = Color.DimGray, MaximumSize = new Size(460, 0) };
 
-    public BindingConfig Result { get; }
+    public AmuletGroup Result { get; }
 
-    public BindingEditForm(BindingConfig source)
+    public GroupEditForm(AmuletGroup source)
     {
         Result = source.Clone();
 
-        Text = "Связка «скилл → амулет»";
+        Text = "Амулет и его скиллы";
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
@@ -33,7 +34,7 @@ public sealed class BindingEditForm : Form
 
         var grid = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Fill };
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 300));
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 340));
 
         void Row(string label, Control c)
         {
@@ -49,11 +50,11 @@ public sealed class BindingEditForm : Form
         delayPanel.Controls.Add(_delayNum, 1, 0);
         delayPanel.Controls.Add(new Label { Text = "мс", AutoSize = true, Anchor = AnchorStyles.Left }, 2, 0);
 
-        Row("Название:", _name);
-        Row("Клавиша скилла:", _skill);
         Row("Клавиша амулета:", _amulet);
-        Row("Задержка:", delayPanel);
-        Row("Комбинация бара:", _hotkey);
+        Row("Скиллы под амулет:", _skills);
+        Row("Пауза амулет → скилл:", delayPanel);
+        Row("Название:", _name);
+        Row("Комбинация «надеть»:", _hotkey);
         grid.Controls.Add(new Label { AutoSize = true });
         grid.Controls.Add(_enabled);
         grid.SetColumnSpan(_hint, 2);
@@ -71,9 +72,9 @@ public sealed class BindingEditForm : Form
         AcceptButton = ok;
         CancelButton = cancel;
 
-        _name.Text = Result.Name;
-        _skill.Value = Result.SkillKey;
         _amulet.Value = Result.AmuletKey;
+        _skills.SetKeys(Result.SkillKeys);
+        _name.Text = Result.Name;
         _hotkey.Value = Result.Hotkey;
         _delay.Value = Math.Clamp(Result.DelayMs, 0, AppConfig.MaxDelayMs);
         _delayNum.Value = _delay.Value;
@@ -81,27 +82,27 @@ public sealed class BindingEditForm : Form
 
         _delay.ValueChanged += (_, _) => _delayNum.Value = _delay.Value;
         _delayNum.ValueChanged += (_, _) => _delay.Value = (int)_delayNum.Value;
-        _skill.ValueChanged += (_, _) => UpdateHint();
         _amulet.ValueChanged += (_, _) => UpdateHint();
+        _skills.ValueChanged += (_, _) => UpdateHint();
         UpdateHint();
 
-        ok.Click += (_, e) =>
+        ok.Click += (_, _) =>
         {
-            if (_skill.Value == Keys.None || _amulet.Value == Keys.None)
+            if (_amulet.Value == Keys.None)
             {
-                MessageBox.Show(this, "Укажите клавишу скилла и клавишу амулета.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(this, "Укажите клавишу амулета.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 DialogResult = DialogResult.None;
                 return;
             }
-            if (_skill.Value == _amulet.Value)
+            if (_skills.SelectedKeys.Contains(_amulet.Value))
             {
-                MessageBox.Show(this, "Скилл и амулет не могут быть на одной клавише.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(this, "Клавиша амулета не может быть одновременно скиллом.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 DialogResult = DialogResult.None;
                 return;
             }
-            Result.Name = string.IsNullOrWhiteSpace(_name.Text) ? "Связка" : _name.Text.Trim();
-            Result.SkillKey = _skill.Value;
             Result.AmuletKey = _amulet.Value;
+            Result.SkillKeys = _skills.SelectedKeys.ToList();
+            Result.Name = _name.Text.Trim();
             Result.Hotkey = _hotkey.Value;
             Result.DelayMs = _delay.Value;
             Result.Enabled = _enabled.Checked;
@@ -110,8 +111,14 @@ public sealed class BindingEditForm : Form
 
     private void UpdateHint()
     {
-        bool odd = (_skill.Value != Keys.None && !KeyCodes.IsHotbarKey(_skill.Value)) ||
-                   (_amulet.Value != Keys.None && !KeyCodes.IsHotbarKey(_amulet.Value));
-        _hint.Text = odd ? "Внимание: панель быстрого доступа игры использует только клавиши 1–0 и F1–F8." : "";
+        string skills = _skills.SelectedKeys.Count == 0 ? "—" : string.Join(", ", _skills.SelectedKeys.Select(KeyCodes.Display));
+        string amulet = KeyCodes.Display(_amulet.Value);
+        bool odd = (_amulet.Value != Keys.None && !KeyCodes.IsHotbarKey(_amulet.Value)) ||
+                   _skills.SelectedKeys.Any(k => !KeyCodes.IsHotbarKey(k));
+        _hint.ForeColor = odd ? Color.DarkOrange : Color.DimGray;
+        _hint.Text = (_skills.SelectedKeys.Count == 0
+                         ? $"Без скиллов: амулет {amulet} надевается только кнопкой на панели или комбинацией."
+                         : $"Нажатие {skills} в игре: сначала надевается амулет {amulet}, затем срабатывает скилл.")
+                     + (odd ? "\nВнимание: панель игры использует только клавиши 1–0 и F1–F8." : "");
     }
 }

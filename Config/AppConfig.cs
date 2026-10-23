@@ -4,48 +4,91 @@ using JdAmulet.Input;
 
 namespace JdAmulet.Config;
 
-public enum RepeatMode
+/// <summary>
+/// Амулет и набор скиллов, которым он нужен. Нажатие любого из скиллов:
+/// сначала надевается амулет (если ещё не надет), затем нажимается скилл.
+/// Группа без скиллов — просто кнопка/комбинация «надеть амулет» (например, основной амулет).
+/// </summary>
+public sealed class AmuletGroup
 {
-    /// <summary>Повторы автоповтора при удержании подавляются.</summary>
-    Ignore = 0,
-    /// <summary>Каждый повтор отправляет скилл без повторного надевания амулета.</summary>
-    SkillOnly = 1,
-}
-
-public sealed class BindingConfig
-{
-    public string Name { get; set; } = "Связка";
-    public Keys SkillKey { get; set; }
+    public string Name { get; set; } = "";
     public Keys AmuletKey { get; set; }
+    public List<Keys> SkillKeys { get; set; } = new();
     public int DelayMs { get; set; } = 20;
     public Keys Hotkey { get; set; }
     public bool Enabled { get; set; } = true;
 
-    public BindingConfig Clone() => (BindingConfig)MemberwiseClone();
-}
+    public AmuletGroup Clone()
+    {
+        var c = (AmuletGroup)MemberwiseClone();
+        c.SkillKeys = new List<Keys>(SkillKeys);
+        return c;
+    }
 
-public sealed class MainAmuletConfig
-{
-    public bool Enabled { get; set; }
-    public string Name { get; set; } = "Основной";
-    public Keys AmuletKey { get; set; } = Keys.D6;
-    public Keys Hotkey { get; set; } = Keys.Control | Keys.D6;
-
-    public MainAmuletConfig Clone() => (MainAmuletConfig)MemberwiseClone();
+    [JsonIgnore]
+    public string DisplayName => string.IsNullOrWhiteSpace(Name) ? "Амулет " + KeyCodes.Display(AmuletKey) : Name;
 }
 
 public sealed class Profile
 {
     public string Name { get; set; } = "Основной";
-    public List<BindingConfig> Bindings { get; set; } = new();
-    public MainAmuletConfig MainAmulet { get; set; } = new();
+    public List<AmuletGroup> Groups { get; set; } = new();
+
+    // --- формат версии 1.0, читается только для миграции ---
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<LegacyBinding>? Bindings { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public LegacyMainAmulet? MainAmulet { get; set; }
 
     public Profile Clone(string name) => new()
     {
         Name = name,
-        Bindings = Bindings.Select(b => b.Clone()).ToList(),
-        MainAmulet = MainAmulet.Clone(),
+        Groups = Groups.Select(g => g.Clone()).ToList(),
     };
+
+    public void MigrateLegacy()
+    {
+        if (Groups.Count == 0 && Bindings is { Count: > 0 })
+        {
+            foreach (IGrouping<Keys, LegacyBinding> byAmulet in Bindings.GroupBy(b => b.AmuletKey & Keys.KeyCode))
+            {
+                Groups.Add(new AmuletGroup
+                {
+                    AmuletKey = byAmulet.Key,
+                    SkillKeys = byAmulet.Select(b => b.SkillKey & Keys.KeyCode).Where(k => k != Keys.None).Distinct().ToList(),
+                    DelayMs = byAmulet.Max(b => b.DelayMs),
+                    Hotkey = byAmulet.Select(b => b.Hotkey).FirstOrDefault(h => h != Keys.None),
+                    Enabled = byAmulet.Any(b => b.Enabled),
+                });
+            }
+        }
+        if (MainAmulet is { Enabled: true } m && m.AmuletKey != Keys.None &&
+            Groups.All(g => (g.AmuletKey & Keys.KeyCode) != (m.AmuletKey & Keys.KeyCode)))
+        {
+            Groups.Add(new AmuletGroup { Name = m.Name ?? "", AmuletKey = m.AmuletKey, Hotkey = m.Hotkey });
+        }
+        Bindings = null;
+        MainAmulet = null;
+    }
+}
+
+public sealed class LegacyBinding
+{
+    public string Name { get; set; } = "";
+    public Keys SkillKey { get; set; }
+    public Keys AmuletKey { get; set; }
+    public int DelayMs { get; set; }
+    public Keys Hotkey { get; set; }
+    public bool Enabled { get; set; } = true;
+}
+
+public sealed class LegacyMainAmulet
+{
+    public bool Enabled { get; set; }
+    public string? Name { get; set; }
+    public Keys AmuletKey { get; set; }
+    public Keys Hotkey { get; set; }
 }
 
 public sealed class OverlayConfig
@@ -53,17 +96,21 @@ public sealed class OverlayConfig
     public bool Visible { get; set; } = true;
     public double Opacity { get; set; } = 0.85;
     public int OffsetX { get; set; } = 160;
+    public int OffsetY { get; set; }
     public bool Locked { get; set; }
 }
 
 public sealed class AppConfig
 {
     public const int MaxDelayMs = 200;
+    public const int MinHoldMs = 5;
+    public const int MaxHoldMs = 150;
 
     public string ProcessName { get; set; } = "ElementClient.exe";
     public InputMode InputMode { get; set; } = InputMode.SendInput;
     public Keys ToggleKey { get; set; } = Keys.Pause;
-    public RepeatMode RepeatMode { get; set; } = RepeatMode.Ignore;
+    /// <summary>Сколько держать нажатой клавишу амулета (и минимум для скилла). Игра опрашивает клавиши раз в кадр.</summary>
+    public int KeyHoldMs { get; set; } = 30;
     public bool AlwaysEquip { get; set; }
     public bool StartMinimized { get; set; }
     public bool LogEnabled { get; set; } = true;
@@ -83,25 +130,15 @@ public sealed class AppConfig
         return p;
     }
 
-    public static Profile CreateDefaultProfile(string name)
+    public static Profile CreateDefaultProfile(string name) => new()
     {
-        var p = new Profile { Name = name };
-        Keys[] skills = { Keys.F1, Keys.F2, Keys.F3, Keys.F4, Keys.F5 };
-        Keys[] amulets = { Keys.D6, Keys.D7, Keys.D8, Keys.D9, Keys.D0 };
-        for (int i = 0; i < 5; i++)
+        Name = name,
+        Groups =
         {
-            p.Bindings.Add(new BindingConfig
-            {
-                Name = $"Связка {i + 1}",
-                SkillKey = skills[i],
-                AmuletKey = amulets[i],
-                DelayMs = 20,
-                Hotkey = Keys.Control | (Keys.D1 + i),
-            });
-        }
-        p.MainAmulet = new MainAmuletConfig { Enabled = false, AmuletKey = Keys.D5, Hotkey = Keys.Control | Keys.D6 };
-        return p;
-    }
+            // Пример: скиллы на 1 и 2 требуют амулет на F1
+            new AmuletGroup { AmuletKey = Keys.F1, SkillKeys = { Keys.D1, Keys.D2 }, DelayMs = 20, Hotkey = Keys.Control | Keys.D1 },
+        },
+    };
 
     public void Normalize()
     {
@@ -110,15 +147,18 @@ public sealed class AppConfig
         Overlay ??= new();
         Overlay.Opacity = Math.Clamp(Overlay.Opacity, 0.2, 1.0);
         Overlay.OffsetX = Math.Max(0, Overlay.OffsetX);
+        Overlay.OffsetY = Math.Max(0, Overlay.OffsetY);
+        KeyHoldMs = Math.Clamp(KeyHoldMs, MinHoldMs, MaxHoldMs);
         foreach (Profile p in Profiles)
         {
-            p.Bindings ??= new();
-            p.MainAmulet ??= new();
+            p.Groups ??= new();
+            p.MigrateLegacy();
             p.Name = string.IsNullOrWhiteSpace(p.Name) ? "Профиль" : p.Name.Trim();
-            foreach (BindingConfig b in p.Bindings)
+            foreach (AmuletGroup g in p.Groups)
             {
-                b.DelayMs = Math.Clamp(b.DelayMs, 0, MaxDelayMs);
-                b.Name ??= "Связка";
+                g.DelayMs = Math.Clamp(g.DelayMs, 0, MaxDelayMs);
+                g.Name ??= "";
+                g.SkillKeys ??= new();
             }
         }
         GetActiveProfile();
@@ -152,9 +192,9 @@ public static class ConfigStore
         }
 
         cfg ??= new AppConfig();
+        cfg.Normalize();
         if (cfg.Profiles.Count == 0)
             cfg.Profiles.Add(AppConfig.CreateDefaultProfile("Основной"));
-        cfg.Normalize();
         return cfg;
     }
 

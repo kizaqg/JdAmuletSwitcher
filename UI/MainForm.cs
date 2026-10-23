@@ -25,22 +25,18 @@ public sealed class MainForm : Form
     private readonly ComboBox _profiles = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 180 };
     private readonly TextBox _processName = new() { Width = 160 };
     private readonly ComboBox _inputMode = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 230 };
-    private readonly ComboBox _repeatMode = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 260 };
+    private readonly NumericUpDown _holdMs = new() { Minimum = AppConfig.MinHoldMs, Maximum = AppConfig.MaxHoldMs, Width = 60 };
     private readonly KeyCaptureBox _toggleKey = new() { Width = 110 };
     private readonly CheckBox _alwaysEquip = new() { Text = "Всегда надевать амулет (не доверять состоянию)", AutoSize = true };
     private readonly CheckBox _startMinimized = new() { Text = "Запускать свёрнутым в трей", AutoSize = true };
     private readonly CheckBox _overlayVisible = new() { Text = "Оверлей-бар", AutoSize = true };
     private readonly TrackBar _overlayOpacity = new() { Minimum = 20, Maximum = 100, TickFrequency = 10, Width = 140, AutoSize = false, Height = 30 };
     private readonly CheckBox _overlayLocked = new() { Text = "Закрепить положение", AutoSize = true };
-    private readonly CheckBox _mainEnabled = new() { Text = "Основной амулет:", AutoSize = true };
-    private readonly TextBox _mainName = new() { Width = 100 };
-    private readonly KeyCaptureBox _mainKey = new() { Width = 70 };
-    private readonly KeyCaptureBox _mainHotkey = new() { Width = 100, AllowModifiers = true };
 
     private readonly DataGridView _grid = new();
     private readonly TrackBar _delaySlider = new() { Minimum = 0, Maximum = AppConfig.MaxDelayMs, TickFrequency = 10, SmallChange = 1, LargeChange = 10, Dock = DockStyle.Fill, AutoSize = false, Height = 30 };
-    private readonly Label _delayLabel = new() { AutoSize = true, Anchor = AnchorStyles.Left, Text = "Задержка выбранной связки: —" };
-    private readonly Button _testButton = new() { Text = "Тест связки (3 с)", AutoSize = true };
+    private readonly Label _delayLabel = new() { AutoSize = true, Anchor = AnchorStyles.Left, Text = "Пауза выбранного амулета: —" };
+    private readonly Button _testButton = new() { Text = "Тест (3 с)", AutoSize = true };
 
     private readonly ListBox _log = new() { Dock = DockStyle.Fill, IntegralHeight = false, HorizontalScrollbar = true, Font = new Font("Consolas", 9f) };
     private readonly CheckBox _logEnabled = new() { Text = "Вести лог", AutoSize = true };
@@ -131,7 +127,6 @@ public sealed class MainForm : Form
     {
         // --- Настройки ---
         _inputMode.Items.AddRange(new object[] { "SendInput (скан-коды) — основной", "PostMessage в окно игры — запасной" });
-        _repeatMode.Items.AddRange(new object[] { "Удержание скилла: игнорировать повторы", "Удержание скилла: повторять скилл без амулета" });
 
         var settings = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 1 };
         settings.Controls.Add(Flow(
@@ -144,13 +139,12 @@ public sealed class MainForm : Form
             L("Процесс игры:"), _processName, B("Применить", (_, _) => ApplyProcessName()),
             L("   Режим ввода:"), _inputMode));
         settings.Controls.Add(Flow(
-            L("Вкл/выкл макросов:"), _toggleKey, _repeatMode));
+            L("Клавиша вкл/выкл макросов:"), _toggleKey,
+            L("   Длительность нажатия:"), _holdMs, L("мс (если игра не видит нажатия — увеличьте до 40–60)")));
         settings.Controls.Add(Flow(
             _alwaysEquip, B("Сбросить состояние амулета", (_, _) => _engine.ResetAmuletState()), _startMinimized));
         settings.Controls.Add(Flow(
             _overlayVisible, L("  Непрозрачность:"), _overlayOpacity, _overlayLocked));
-        settings.Controls.Add(Flow(
-            _mainEnabled, L("название"), _mainName, L("клавиша"), _mainKey, L("комбинация"), _mainHotkey));
         var settingsBox = new GroupBox { Text = "Настройки", Dock = DockStyle.Fill, AutoSize = true };
         settingsBox.Controls.Add(settings);
 
@@ -166,23 +160,23 @@ public sealed class MainForm : Form
         _grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         _grid.BackgroundColor = SystemColors.Window;
         _grid.Columns.Add(new DataGridViewCheckBoxColumn { HeaderText = "Вкл", FillWeight = 30 });
-        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Название", FillWeight = 120 });
-        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Скилл", FillWeight = 60 });
-        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Амулет", FillWeight = 60 });
-        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Задержка, мс", FillWeight = 70 });
-        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Комбинация бара", FillWeight = 90 });
-        _grid.CellDoubleClick += (_, e) => { if (e.RowIndex >= 0) EditBinding(); };
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Амулет", FillWeight = 55 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Скиллы под этот амулет", FillWeight = 150 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Пауза, мс", FillWeight = 55 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Название", FillWeight = 90 });
+        _grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Комбинация «надеть»", FillWeight = 85 });
+        _grid.CellDoubleClick += (_, e) => { if (e.RowIndex >= 0) EditGroup(); };
         _grid.SelectionChanged += (_, _) => SyncDelaySlider();
 
         _testButton.Click += async (_, _) => await TestBindingAsync();
         _delaySlider.ValueChanged += (_, _) => OnDelaySliderChanged();
 
         var gridButtons = Flow(
-            B("Добавить", (_, _) => AddBinding()),
-            B("Изменить", (_, _) => EditBinding()),
-            B("Удалить", (_, _) => DeleteBinding()),
-            B("▲", (_, _) => MoveBinding(-1)),
-            B("▼", (_, _) => MoveBinding(1)),
+            B("Добавить амулет", (_, _) => AddGroup()),
+            B("Изменить", (_, _) => EditGroup()),
+            B("Удалить", (_, _) => DeleteGroup()),
+            B("▲", (_, _) => MoveGroup(-1)),
+            B("▼", (_, _) => MoveGroup(1)),
             _testButton);
 
         var sliderRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, AutoSize = true };
@@ -198,7 +192,7 @@ public sealed class MainForm : Form
         bindingsLayout.Controls.Add(_grid, 0, 0);
         bindingsLayout.Controls.Add(sliderRow, 0, 1);
         bindingsLayout.Controls.Add(gridButtons, 0, 2);
-        var bindingsBox = new GroupBox { Text = "Связки «скилл → амулет»", Dock = DockStyle.Fill };
+        var bindingsBox = new GroupBox { Text = "Амулеты и скиллы: нажали скилл → надевается его амулет → срабатывает скилл", Dock = DockStyle.Fill };
         bindingsBox.Controls.Add(bindingsLayout);
 
         // --- Лог ---
@@ -234,7 +228,7 @@ public sealed class MainForm : Form
             ApplyConfig();
         };
         _inputMode.SelectedIndexChanged += (_, _) => Change(() => _config.InputMode = (InputMode)_inputMode.SelectedIndex);
-        _repeatMode.SelectedIndexChanged += (_, _) => Change(() => _config.RepeatMode = (RepeatMode)_repeatMode.SelectedIndex);
+        _holdMs.ValueChanged += (_, _) => Change(() => _config.KeyHoldMs = (int)_holdMs.Value);
         _toggleKey.ValueChanged += (_, _) => Change(() => _config.ToggleKey = _toggleKey.Value == Keys.None ? Keys.Pause : _toggleKey.Value);
         _alwaysEquip.CheckedChanged += (_, _) => Change(() => _config.AlwaysEquip = _alwaysEquip.Checked);
         _startMinimized.CheckedChanged += (_, _) => Change(() => _config.StartMinimized = _startMinimized.Checked);
@@ -248,10 +242,6 @@ public sealed class MainForm : Form
             _overlay.ApplyAppearance();
             ScheduleSave();
         };
-        _mainEnabled.CheckedChanged += (_, _) => Change(() => Profile.MainAmulet.Enabled = _mainEnabled.Checked);
-        _mainName.Leave += (_, _) => Change(() => Profile.MainAmulet.Name = _mainName.Text.Trim());
-        _mainKey.ValueChanged += (_, _) => Change(() => Profile.MainAmulet.AmuletKey = _mainKey.Value);
-        _mainHotkey.ValueChanged += (_, _) => Change(() => Profile.MainAmulet.Hotkey = _mainHotkey.Value);
     }
 
     private void BuildTray()
@@ -283,7 +273,7 @@ public sealed class MainForm : Form
         {
             _processName.Text = _config.ProcessName;
             _inputMode.SelectedIndex = (int)_config.InputMode;
-            _repeatMode.SelectedIndex = (int)_config.RepeatMode;
+            _holdMs.Value = Math.Clamp(_config.KeyHoldMs, AppConfig.MinHoldMs, AppConfig.MaxHoldMs);
             _toggleKey.Value = _config.ToggleKey;
             _alwaysEquip.Checked = _config.AlwaysEquip;
             _startMinimized.Checked = _config.StartMinimized;
@@ -313,11 +303,6 @@ public sealed class MainForm : Form
         _loading = true;
         try
         {
-            MainAmuletConfig m = Profile.MainAmulet;
-            _mainEnabled.Checked = m.Enabled;
-            _mainName.Text = m.Name;
-            _mainKey.Value = m.AmuletKey;
-            _mainHotkey.Value = m.Hotkey;
             RefreshGrid();
         }
         finally { _loading = was; }
@@ -327,10 +312,10 @@ public sealed class MainForm : Form
     {
         if (select < 0) select = _grid.CurrentRow?.Index ?? 0;
         _grid.Rows.Clear();
-        foreach (BindingConfig b in Profile.Bindings)
+        foreach (AmuletGroup g in Profile.Groups)
         {
-            _grid.Rows.Add(b.Enabled, b.Name, KeyCodes.Display(b.SkillKey), KeyCodes.Display(b.AmuletKey),
-                b.DelayMs, KeyCodes.Display(b.Hotkey));
+            string skills = g.SkillKeys.Count == 0 ? "— (только кнопка/комбинация)" : string.Join(", ", g.SkillKeys.Select(KeyCodes.Display));
+            _grid.Rows.Add(g.Enabled, KeyCodes.Display(g.AmuletKey), skills, g.DelayMs, g.Name, KeyCodes.Display(g.Hotkey));
         }
         if (_grid.Rows.Count > 0)
         {
@@ -373,48 +358,44 @@ public sealed class MainForm : Form
 
     private int SelectedIndex => _grid.CurrentRow?.Index ?? -1;
 
-    private void AddBinding()
+    private void AddGroup()
     {
-        int n = Profile.Bindings.Count;
-        var b = new BindingConfig
-        {
-            Name = $"Связка {n + 1}",
-            DelayMs = 20,
-            Hotkey = n < 9 ? Keys.Control | (Keys.D1 + n) : Keys.None,
-        };
-        using var dlg = new BindingEditForm(b);
+        var g = new AmuletGroup { DelayMs = 20 };
+        int n = Profile.Groups.Count;
+        if (n < 9) g.Hotkey = Keys.Control | (Keys.D1 + n);
+        using var dlg = new GroupEditForm(g);
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
-        Profile.Bindings.Add(dlg.Result);
-        RefreshGrid(Profile.Bindings.Count - 1);
+        Profile.Groups.Add(dlg.Result);
+        RefreshGrid(Profile.Groups.Count - 1);
         ApplyConfig();
     }
 
-    private void EditBinding()
+    private void EditGroup()
     {
         int i = SelectedIndex;
-        if (i < 0 || i >= Profile.Bindings.Count) return;
-        using var dlg = new BindingEditForm(Profile.Bindings[i]);
+        if (i < 0 || i >= Profile.Groups.Count) return;
+        using var dlg = new GroupEditForm(Profile.Groups[i]);
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
-        Profile.Bindings[i] = dlg.Result;
+        Profile.Groups[i] = dlg.Result;
         RefreshGrid(i);
         ApplyConfig();
     }
 
-    private void DeleteBinding()
+    private void DeleteGroup()
     {
         int i = SelectedIndex;
-        if (i < 0 || i >= Profile.Bindings.Count) return;
-        if (MessageBox.Show(this, $"Удалить связку «{Profile.Bindings[i].Name}»?", Text,
+        if (i < 0 || i >= Profile.Groups.Count) return;
+        if (MessageBox.Show(this, $"Удалить «{Profile.Groups[i].DisplayName}»?", Text,
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-        Profile.Bindings.RemoveAt(i);
+        Profile.Groups.RemoveAt(i);
         RefreshGrid(i);
         ApplyConfig();
     }
 
-    private void MoveBinding(int dir)
+    private void MoveGroup(int dir)
     {
         int i = SelectedIndex, j = i + dir;
-        List<BindingConfig> list = Profile.Bindings;
+        List<AmuletGroup> list = Profile.Groups;
         if (i < 0 || j < 0 || j >= list.Count) return;
         (list[i], list[j]) = (list[j], list[i]);
         RefreshGrid(j);
@@ -424,13 +405,13 @@ public sealed class MainForm : Form
     private void SyncDelaySlider()
     {
         int i = SelectedIndex;
-        bool has = i >= 0 && i < Profile.Bindings.Count;
+        bool has = i >= 0 && i < Profile.Groups.Count;
         bool was = _loading;
         _loading = true;
         _delaySlider.Enabled = has;
         _testButton.Enabled = has;
-        if (has) _delaySlider.Value = Math.Clamp(Profile.Bindings[i].DelayMs, 0, AppConfig.MaxDelayMs);
-        _delayLabel.Text = has ? $"Задержка «{Profile.Bindings[i].Name}»: {_delaySlider.Value} мс" : "Задержка выбранной связки: —";
+        if (has) _delaySlider.Value = Math.Clamp(Profile.Groups[i].DelayMs, 0, AppConfig.MaxDelayMs);
+        _delayLabel.Text = has ? $"Пауза «{Profile.Groups[i].DisplayName}»: {_delaySlider.Value} мс" : "Пауза выбранного амулета: —";
         _loading = was;
     }
 
@@ -438,11 +419,11 @@ public sealed class MainForm : Form
     {
         if (_loading) return;
         int i = SelectedIndex;
-        if (i < 0 || i >= Profile.Bindings.Count) return;
-        BindingConfig b = Profile.Bindings[i];
-        b.DelayMs = _delaySlider.Value;
-        _delayLabel.Text = $"Задержка «{b.Name}»: {b.DelayMs} мс";
-        _grid.Rows[i].Cells[4].Value = b.DelayMs;
+        if (i < 0 || i >= Profile.Groups.Count) return;
+        AmuletGroup g = Profile.Groups[i];
+        g.DelayMs = _delaySlider.Value;
+        _delayLabel.Text = $"Пауза «{g.DisplayName}»: {g.DelayMs} мс";
+        _grid.Rows[i].Cells[3].Value = g.DelayMs;
         _engine.Apply(_config); // мгновенно, без перестройки UI
         ScheduleSave();
     }
@@ -450,12 +431,12 @@ public sealed class MainForm : Form
     private async Task TestBindingAsync()
     {
         int i = SelectedIndex;
-        if (i < 0 || i >= Profile.Bindings.Count) return;
-        BindingConfig cfg = Profile.Bindings[i];
-        CompiledBinding? b = _engine.Bindings.FirstOrDefault(x => x.Name == cfg.Name && x.SkillKey == (cfg.SkillKey & Keys.KeyCode));
-        if (b == null)
+        if (i < 0 || i >= Profile.Groups.Count) return;
+        AmuletGroup cfg = Profile.Groups[i];
+        CompiledGroup? g = _engine.Groups.FirstOrDefault(x => x.AmuletKey == (cfg.AmuletKey & Keys.KeyCode));
+        if (g == null)
         {
-            _engine.Log($"Тест: связка «{cfg.Name}» выключена или некорректна.");
+            _engine.Log($"Тест: «{cfg.DisplayName}» выключен или настроен некорректно.");
             return;
         }
 
@@ -468,7 +449,7 @@ public sealed class MainForm : Form
                 _testButton.Text = $"Переключитесь в игру… {s}";
                 await Task.Delay(1000); // UI-отсчёт; к вводу отношения не имеет
             }
-            _engine.Run(b, isTest: true);
+            _engine.Test(g);
         }
         finally
         {

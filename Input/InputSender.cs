@@ -10,6 +10,13 @@ public enum InputMode
     PostMessage = 1,
 }
 
+/// <summary>Одно событие клавиатуры: нажатие или отпускание.</summary>
+public readonly record struct KeyAction(KeyStroke Key, bool Up)
+{
+    public static KeyAction Down(KeyStroke k) => new(k, false);
+    public static KeyAction Release(KeyStroke k) => new(k, true);
+}
+
 public interface IInputJobHandler<TJob> where TJob : struct
 {
     /// <summary>Выполняется в выделенном потоке ввода.</summary>
@@ -19,9 +26,8 @@ public interface IInputJobHandler<TJob> where TJob : struct
 }
 
 /// <summary>
-/// Выделенный поток ввода (ThreadPriority.Highest). Ждёт задания на AutoResetEvent,
-/// без опроса. Каждое нажатие отправляется парой down+up в одном вызове SendInput —
-/// вставка атомарна, «зажатой» клавиши не остаётся даже при ошибке.
+/// Выделенный поток ввода (ThreadPriority.Highest). Ждёт задания на AutoResetEvent, без опроса.
+/// Каждый вызов SendInput атомарен; при частичной вставке затронутые клавиши отпускаются.
 /// </summary>
 public sealed unsafe class InputSender<TJob> : IDisposable where TJob : struct
 {
@@ -81,15 +87,15 @@ public sealed unsafe class InputSender<TJob> : IDisposable where TJob : struct
     }
 
     /// <summary>
-    /// Отправляет нажатия a и (опционально) b. В режиме SendInput — одним вызовом:
-    /// [отпускание модификаторов] a↓ a↑ [b↓ b↑] [возврат модификаторов].
+    /// Отправляет последовательность событий клавиатуры. В режиме SendInput — одним вызовом
+    /// (вставка атомарна): [отпускание модификаторов] события [возврат модификаторов].
     /// </summary>
-    public bool Send(KeyStroke a, KeyStroke b, int releaseMods, int restoreMods, nint targetHwnd)
+    public bool Send(ReadOnlySpan<KeyAction> actions, int releaseMods, int restoreMods, nint targetHwnd)
     {
         if (Mode == InputMode.PostMessage)
-            return PostTaps(a, b, targetHwnd);
+            return PostActions(actions, targetHwnd);
 
-        INPUT* buf = stackalloc INPUT[24];
+        INPUT* buf = stackalloc INPUT[32];
         int n = 0;
 
         releaseMods &= ModBits.Releasable;
@@ -104,8 +110,9 @@ public sealed unsafe class InputSender<TJob> : IDisposable where TJob : struct
                 if ((releaseMods & bit) != 0) AddScan(buf, ref n, ModBits.Scan(bit), true);
         }
 
-        if (!a.IsEmpty) { AddScan(buf, ref n, a.Scan, false); AddScan(buf, ref n, a.Scan, true); }
-        if (!b.IsEmpty) { AddScan(buf, ref n, b.Scan, false); AddScan(buf, ref n, b.Scan, true); }
+        int limit = Math.Min(actions.Length, 16);
+        for (int i = 0; i < limit; i++)
+            if (!actions[i].Key.IsEmpty) AddScan(buf, ref n, actions[i].Key.Scan, actions[i].Up);
 
         // Alt не возвращаем: иначе физическое отпускание Alt откроет системное меню окна
         restoreMods &= ModBits.Releasable & ~ModBits.AnyAlt;
@@ -119,31 +126,27 @@ public sealed unsafe class InputSender<TJob> : IDisposable where TJob : struct
 
         LastError = Marshal.GetLastWin32Error();
         // Часть событий могла пройти: гарантированно отпускаем всё, что могло нажаться
-        Span<ushort> ups = stackalloc ushort[2];
+        Span<ushort> ups = stackalloc ushort[16];
         int u = 0;
-        if (!a.IsEmpty) ups[u++] = a.Scan;
-        if (!b.IsEmpty) ups[u++] = b.Scan;
+        for (int i = 0; i < limit; i++)
+            if (!actions[i].Key.IsEmpty) ups[u++] = actions[i].Key.Scan;
         ReleaseKeys(ups[..u]);
         return false;
     }
 
-    private bool PostTaps(KeyStroke a, KeyStroke b, nint hwnd)
+    private bool PostActions(ReadOnlySpan<KeyAction> actions, nint hwnd)
     {
         if (hwnd == 0) { LastError = 1400; return false; } // ERROR_INVALID_WINDOW_HANDLE
         bool ok = true;
-        if (!a.IsEmpty) ok &= PostTap(hwnd, a);
-        if (!b.IsEmpty) ok &= PostTap(hwnd, b);
+        foreach (KeyAction a in actions)
+        {
+            if (a.Key.IsEmpty) continue;
+            uint l = 1u | ((uint)(a.Key.Scan & 0xFF) << 16) | (a.Key.Extended ? 1u << 24 : 0u);
+            if (a.Up) l |= 0xC0000000u; // предыдущее состояние = нажата, переход = отпускание
+            ok &= NativeMethods.PostMessageW(hwnd, a.Up ? NativeMethods.WM_KEYUP : NativeMethods.WM_KEYDOWN, a.Key.Vk, (nint)l);
+        }
         if (!ok) LastError = Marshal.GetLastWin32Error();
         return ok;
-    }
-
-    private static bool PostTap(nint hwnd, KeyStroke k)
-    {
-        uint lDown = 1u | ((uint)(k.Scan & 0xFF) << 16) | (k.Extended ? 1u << 24 : 0u);
-        uint lUp = lDown | 0xC0000000u; // предыдущее состояние = нажата, переход = отпускание
-        bool d = NativeMethods.PostMessageW(hwnd, NativeMethods.WM_KEYDOWN, k.Vk, (nint)lDown);
-        bool u = NativeMethods.PostMessageW(hwnd, NativeMethods.WM_KEYUP, k.Vk, (nint)lUp);
-        return d & u;
     }
 
     private static void AddScan(INPUT* buf, ref int n, ushort scan, bool up)
